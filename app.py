@@ -34,7 +34,11 @@ def save_students(students):
 
 def get_credentials():
     # Déployé sur Streamlit Cloud → secrets
-    if "gcp_service_account" in st.secrets:
+    try:
+        has_secrets = "gcp_service_account" in st.secrets
+    except Exception:
+        has_secrets = False
+    if has_secrets:
         sa_info = dict(st.secrets["gcp_service_account"])
         return service_account.Credentials.from_service_account_info(sa_info)
     # Local → fichier JSON
@@ -113,8 +117,8 @@ with tab_register:
 
         if submitted and email:
             email = email.strip().lower()
-            if not email.endswith("@gmail.com") and not email.endswith(".com"):
-                st.warning("Vérifiez que c'est bien une adresse Google valide.")
+            if "@" not in email or "." not in email.split("@")[-1]:
+                st.warning("Vérifiez que c'est bien une adresse email valide.")
             elif email in students:
                 st.info("Vous êtes déjà inscrit(e).")
             else:
@@ -137,6 +141,12 @@ with tab_admin:
     else:
         st.write(f"**{len(students)} étudiant(s) inscrit(s)**")
         st.dataframe({"Email": students}, width="stretch")
+        st.download_button(
+            "📥 Exporter la liste (CSV)",
+            data="email\n" + "\n".join(students),
+            file_name="students.csv",
+            mime="text/csv",
+        )
 
         st.divider()
 
