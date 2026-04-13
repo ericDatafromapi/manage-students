@@ -163,10 +163,20 @@ with tab_admin:
             if st.button("✅ Attribuer à tous les étudiants", type="primary"):
                 role_values = [ROLES[r] for r in roles_to_add]
                 progress = st.progress(0)
+                failed = []
                 for i, student_email in enumerate(students):
-                    add_roles(client, PROJECT_ID, student_email, role_values)
+                    try:
+                        add_roles(client, PROJECT_ID, student_email, role_values)
+                    except Exception as e:
+                        failed.append((student_email, str(e)))
                     progress.progress((i + 1) / len(students))
-                st.success(f"Accès attribués à {len(students)} étudiant(s).")
+                if failed:
+                    st.warning(f"{len(failed)} erreur(s) :")
+                    for email_err, err_msg in failed:
+                        st.error(f"**{email_err}** : {err_msg}")
+                succeeded = len(students) - len(failed)
+                if succeeded > 0:
+                    st.success(f"Accès attribués à {succeeded} étudiant(s).")
 
         with col2:
             st.subheader("Retirer les accès")
@@ -179,10 +189,20 @@ with tab_admin:
             if st.button("🚫 Retirer à tous les étudiants", type="secondary"):
                 role_values = [ROLES[r] for r in roles_to_remove]
                 progress = st.progress(0)
+                failed = []
                 for i, student_email in enumerate(students):
-                    remove_roles(client, PROJECT_ID, student_email, role_values)
+                    try:
+                        remove_roles(client, PROJECT_ID, student_email, role_values)
+                    except Exception as e:
+                        failed.append((student_email, str(e)))
                     progress.progress((i + 1) / len(students))
-                st.success(f"Accès retirés pour {len(students)} étudiant(s).")
+                if failed:
+                    st.warning(f"{len(failed)} erreur(s) :")
+                    for email_err, err_msg in failed:
+                        st.error(f"**{email_err}** : {err_msg}")
+                succeeded = len(students) - len(failed)
+                if succeeded > 0:
+                    st.success(f"Accès retirés pour {succeeded} étudiant(s).")
 
         st.divider()
 
