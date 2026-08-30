@@ -139,6 +139,33 @@ def set_iam_policy(client, project_id, policy):
     return client.set_iam_policy(request=request)
 
 
+def message_erreur_acces(e, email):
+    """Traduit une erreur d'attribution d'acces en message actionnable.
+
+    Le cas de loin le plus frequent en cours : l'adresse saisie n'est pas un
+    compte Google existant. Google refuse alors d'ecrire la strategie IAM, et
+    l'exception brute (InvalidArgument) est illisible — pire, Streamlit Cloud
+    en masque le detail. On la traduit plutot que de laisser planter l'app.
+    """
+    txt = str(e)
+    invalide = (
+        type(e).__name__ in ("InvalidArgument", "BadRequest")
+        or "does not exist" in txt
+        or "not a valid" in txt
+        or "Invalid principal" in txt
+        or "userByEmail" in txt
+    )
+    if invalide:
+        return (
+            f"**{email}** n'est pas reconnue par Google comme un compte existant.\n\n"
+            "Google refuse d'écrire la règle d'accès, donc **rien n'a été modifié** — "
+            "ni pour cet étudiant, ni pour les autres.\n\n"
+            "→ Fais-lui donner l'adresse de son **compte Google** (personnel ou scolaire, "
+            "mais un compte qui existe vraiment), corrige-la dans la liste, et relance."
+        )
+    return f"**{email}** : {txt}"
+
+
 def add_roles(client, project_id, email, roles):
     policy = get_iam_policy(client, project_id)
     member = f"user:{email}"
@@ -465,26 +492,33 @@ with tab_admin:
                         remove_roles(client, PROJECT_ID, student_email,
                                      list(ROLES_TROP_LARGES.values()))
                     except Exception as e:
-                        failed.append((student_email, str(e)))
+                        failed.append((student_email, e))
                     progress.progress((i + 1) / len(students))
                 # Accès lecture, dataset par dataset, en une seule écriture par dataset
+                tous_refuses = set()
                 for ds_id in DATASETS_AUTORISES:
                     try:
                         refuses = dataset_access(bqc, PROJECT_ID, ds_id, students, accorder=True)
-                        if refuses:
-                            st.error(
-                                f"`{ds_id}` : {len(refuses)} adresse(s) refusée(s) — "
-                                "ce ne sont pas des comptes Google existants. "
-                                f"À corriger : {', '.join(refuses)}"
-                            )
-                        else:
+                        tous_refuses.update(refuses)
+                        if not refuses:
                             st.caption(f"Lecture accordée sur `{ds_id}`")
                     except Exception as e:
-                        failed.append((ds_id, str(e)))
+                        failed.append((ds_id, e))
+                if tous_refuses:
+                    st.error(
+                        f"**{len(tous_refuses)} adresse(s) refusée(s) par Google** — "
+                        "ce ne sont pas des comptes Google existants, et ces étudiants "
+                        "n'auront **aucun accès** tant que l'adresse n'est pas corrigée :\n\n"
+                        + "\n".join(f"- `{e}`" for e in sorted(tous_refuses))
+                        + "\n\nLes autres étudiants ont bien reçu leurs accès."
+                    )
                 if failed:
-                    st.warning(f"{len(failed)} erreur(s) :")
-                    for email_err, err_msg in failed:
-                        st.error(f"**{email_err}** : {err_msg}")
+                    st.warning(
+                        f"{len(failed)} étudiant(s) sur {len(students)} n'ont pas pu "
+                        "recevoir leurs accès. Les autres sont bien servis."
+                    )
+                    for email_err, err_obj in failed:
+                        st.error(message_erreur_acces(err_obj, email_err))
                 succeeded = len(students) - len(failed)
                 if succeeded > 0:
                     st.success(f"Accès attribués à {succeeded} étudiant(s).")
@@ -505,13 +539,13 @@ with tab_admin:
                     try:
                         remove_roles(client, PROJECT_ID, student_email, role_values)
                     except Exception as e:
-                        failed.append((student_email, str(e)))
+                        failed.append((student_email, e))
                     progress.progress((i + 1) / len(students))
                 for ds_id in DATASETS_AUTORISES:
                     try:
                         dataset_access(bqc, PROJECT_ID, ds_id, students, accorder=False)
                     except Exception as e:
-                        failed.append((ds_id, str(e)))
+                        failed.append((ds_id, e))
                 if failed:
                     st.warning(f"{len(failed)} erreur(s) :")
                     for email_err, err_msg in failed:
@@ -528,27 +562,53 @@ with tab_admin:
         col3, col4 = st.columns(2)
         with col3:
             if st.button(f"✅ Attribuer les accès à {selected_email}"):
-                add_roles(client, PROJECT_ID, selected_email, list(ROLES.values()))
-                remove_roles(client, PROJECT_ID, selected_email, list(ROLES_TROP_LARGES.values()))
-                for ds_id in DATASETS_AUTORISES:
-                    dataset_access(bqc, PROJECT_ID, ds_id, [selected_email], accorder=True)
-                st.success(f"Accès attribués à {selected_email} ({', '.join(DATASETS_AUTORISES)})")
+                try:
+                    add_roles(client, PROJECT_ID, selected_email, list(ROLES.values()))
+                    remove_roles(client, PROJECT_ID, selected_email,
+                                 list(ROLES_TROP_LARGES.values()))
+                    refuses = []
+                    for ds_id in DATASETS_AUTORISES:
+                        refuses += dataset_access(bqc, PROJECT_ID, ds_id,
+                                                  [selected_email], accorder=True)
+                    if refuses:
+                        st.error(message_erreur_acces(
+                            Exception("userByEmail refusé"), selected_email))
+                    else:
+                        st.success(
+                            f"Accès attribués à {selected_email} "
+                            f"({', '.join(DATASETS_AUTORISES)})"
+                        )
+                except Exception as e:
+                    st.error(message_erreur_acces(e, selected_email))
         with col4:
             if st.button(f"🚫 Retirer les accès de {selected_email}"):
-                remove_roles(client, PROJECT_ID, selected_email, list(ROLES.values()))
-                for ds_id in DATASETS_AUTORISES:
-                    dataset_access(bqc, PROJECT_ID, ds_id, [selected_email], accorder=False)
-                st.success(f"Accès retirés pour {selected_email}")
+                try:
+                    remove_roles(client, PROJECT_ID, selected_email, list(ROLES.values()))
+                    for ds_id in DATASETS_AUTORISES:
+                        dataset_access(bqc, PROJECT_ID, ds_id,
+                                       [selected_email], accorder=False)
+                    st.success(f"Accès retirés pour {selected_email}")
+                except Exception as e:
+                    st.error(message_erreur_acces(e, selected_email))
 
         st.divider()
 
         st.subheader("Supprimer un étudiant")
         email_to_remove = st.selectbox("Étudiant à supprimer", students, key="remove_student")
         if st.button("🗑️ Supprimer de la liste", type="secondary"):
-            remove_roles(client, PROJECT_ID, email_to_remove, list(ROLES.values()))
-            for ds_id in DATASETS_AUTORISES:
-                dataset_access(bqc, PROJECT_ID, ds_id, [email_to_remove], accorder=False)
+            try:
+                remove_roles(client, PROJECT_ID, email_to_remove, list(ROLES.values()))
+                for ds_id in DATASETS_AUTORISES:
+                    dataset_access(bqc, PROJECT_ID, ds_id, [email_to_remove], accorder=False)
+            except Exception as e:
+                # Une adresse invalide n'a jamais recu d'acces : on la retire quand meme
+                # de la liste, sinon elle y reste bloquee pour toujours.
+                st.warning(
+                    f"Retrait des accès impossible ({type(e).__name__}) — "
+                    "probablement parce qu'ils n'avaient jamais été accordés. "
+                    "L'étudiant est quand même retiré de la liste."
+                )
             students.remove(email_to_remove)
             save_students(students)
-            st.success(f"{email_to_remove} supprimé(e) et accès retirés.")
+            st.success(f"{email_to_remove} supprimé(e) de la liste.")
             st.rerun()
