@@ -43,9 +43,14 @@ ROLES_TROP_LARGES = {
     "bigquery.dataEditor": "roles/bigquery.dataEditor",
 }
 
-# Mapping numero -> perimetre de l'examen final (40 cellules marque x plateforme).
-# Figé par la graine du generateur (RANDOM_SEED = 20260621) ; source de verite :
+# Mapping numero -> perimetre de l'examen final.
+# Fige par la graine du generateur (RANDOM_SEED = 20260621) ; source de verite :
 # "3. Examen final/INTERNE - ne pas diffuser/Examen_Final_Tirage_Correspondance.csv".
+#
+# La cellule 35 (Brisa x TikTok) est VOLONTAIREMENT ABSENTE : c'est le perimetre
+# des 3 TP, de la requete canari du J4-C3 et du template Looker. L'etudiant qui la
+# tirerait aurait passe quatre jours sur exactement ces donnees.
+# -> 39 perimetres reellement attribuables.
 PERIMETRES = [
     (1, "UrbanPulse", "Instagram", "urbanpulse", "instagram"),
     (2, "FitForm", "YouTube", "fitform", "youtube"),
@@ -81,7 +86,7 @@ PERIMETRES = [
     (32, "UrbanPulse", "Pinterest", "urbanpulse", "pinterest"),
     (33, "Brisa", "Instagram", "brisa", "instagram"),
     (34, "Vestio", "YouTube", "vestio", "youtube"),
-    (35, "Brisa", "TikTok", "brisa", "tiktok"),
+    # (35, "Brisa", "TikTok", ...) -> RETIRE : perimetre d'entrainement des TP.
     (36, "Nordska", "Instagram", "nordska", "instagram"),
     (37, "Nordska", "YouTube", "nordska", "youtube"),
     (38, "Nordska", "X (Twitter)", "nordska", "x"),
@@ -248,15 +253,33 @@ def build_exam_assignments_csv(students):
 
     Le brassage vient du mapping numero -> cellule, randomise a la generation des
     donnees : le 1er inscrit ne tombe pas sur la 1re marque de la liste.
+
+    PLUS D'ETUDIANTS QUE DE PERIMETRES (53 pour 39) : on RECOMMENCE la liste au
+    lieu de tronquer. Surtout pas un zip(), qui ferait disparaitre silencieusement
+    les etudiants au-dela du 39e du fichier remis au surveillant.
+    La colonne "partage_avec" signale les periemtres attribues deux fois, pour que
+    le surveillant n'assoie pas les deux etudiants cote a cote.
     """
+    total = len(students)
+    nb_perimetres = len(PERIMETRES)
+
+    # Combien de fois chaque perimetre est-il utilise pour cet effectif ?
+    occurrences = {}
+    for i in range(total):
+        numero = PERIMETRES[i % nb_perimetres][0]
+        occurrences.setdefault(numero, []).append(students[i])
+
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(["numero", "email", "nom_a_completer", "marque", "plateforme",
-                     "brand_id", "platform_id"])
+                     "brand_id", "platform_id", "partage_avec"])
 
-    for email, perimetre in zip(students, PERIMETRES):
-        numero, marque, plateforme, brand_id, platform_id = perimetre
-        writer.writerow([numero, email, "", marque, plateforme, brand_id, platform_id])
+    for i, email in enumerate(students):
+        numero, marque, plateforme, brand_id, platform_id = PERIMETRES[i % nb_perimetres]
+        autres = [e for e in occurrences[numero] if e != email]
+        partage = " ; ".join(autres) if autres else ""
+        writer.writerow([numero, email, "", marque, plateforme,
+                         brand_id, platform_id, partage])
 
     return buffer.getvalue()
 
@@ -397,20 +420,22 @@ with tab_admin:
             )
 
         with col_dl2:
-            trop_nombreux = len(students) > len(PERIMETRES)
             st.download_button(
                 "🎓 Attributions d'examen (CSV)",
                 data=build_exam_assignments_csv(students),
                 file_name=f"attributions_examen_{COURS['nom'].replace(' ','_').replace('&','et')}_{date.today().isoformat()}.csv",
                 mime="text/csv",
-                disabled=trop_nombreux,
                 width="stretch",
                 help="Liste nominative à remettre au surveillant : un étudiant, un périmètre.",
             )
-            if trop_nombreux:
-                st.error(
-                    f"{len(students)} étudiants pour {len(PERIMETRES)} périmètres disponibles. "
-                    "Il faut générer des cellules supplémentaires avant de pouvoir exporter."
+            if len(students) > len(PERIMETRES):
+                partages = len(students) - len(PERIMETRES)
+                st.warning(
+                    f"{len(students)} étudiants pour {len(PERIMETRES)} périmètres : "
+                    f"**{partages} périmètres seront attribués à deux étudiants** "
+                    f"({len(PERIMETRES) - partages} uniques). C'est assumé — l'épreuve est "
+                    "individuelle et surveillée. La colonne `partage_avec` du CSV indique "
+                    "les binômes, à ne pas placer côte à côte."
                 )
 
         st.divider()
