@@ -4,7 +4,8 @@ import io
 import json
 import os
 from datetime import date
-from google.cloud import bigquery, resourcemanager_v3
+from google.api_core import exceptions as gexc
+from google.cloud import bigquery, resourcemanager_v3, storage
 from google.iam.v1 import iam_policy_pb2, policy_pb2
 from google.oauth2 import service_account
 
@@ -19,8 +20,15 @@ COURS = {
 
 PROJECT_ID = "training-project-483615"
 SERVICE_ACCOUNT_KEY = "dbt_training_service_account_key.json"
-STUDENTS_FILE = "students.json"
 ADMIN_PASSWORD = "aivancity2026"
+
+# La liste des inscrits vit sur Cloud Storage, PAS dans un fichier local.
+# Streamlit Cloud reconstruit le conteneur a chaque redemarrage ou redeploiement :
+# un `students.json` ecrit sur le disque de l'app disparait avec lui, et il emporte
+# l'attribution des sujets d'examen, qui depend de l'ORDRE de cette liste.
+# Un objet GCS survit a tout ca.
+BUCKET_ETAT = "precedent_students"
+CHEMIN_ETAT = "gcp-access-manager/social_data_et_social_listening_2026/students.json"
 
 # Rôles accordés AU NIVEAU DU PROJET. Volontairement réduits au strict nécessaire :
 # `jobUser` permet de lancer des requêtes (il n'existe pas d'équivalent par dataset),
@@ -96,16 +104,74 @@ PERIMETRES = [
 
 # --- Helpers ---
 
-def load_students():
-    if os.path.exists(STUDENTS_FILE):
-        with open(STUDENTS_FILE, "r") as f:
-            return json.load(f)
-    return []
+def blob_etat(credentials):
+    """Objet GCS qui contient la liste des inscrits."""
+    sc = storage.Client(project=PROJECT_ID, credentials=credentials)
+    return sc.bucket(BUCKET_ETAT).blob(CHEMIN_ETAT)
 
 
-def save_students(students):
-    with open(STUDENTS_FILE, "w") as f:
-        json.dump(students, f, indent=2)
+def load_students(blob):
+    """Renvoie (liste des inscrits, generation de l'objet).
+
+    La generation est le numero de version GCS de l'objet : on la garde pour
+    n'ecrire que si personne n'a modifie la liste entre-temps (cf. save_students).
+    0 signifie « l'objet n'existe pas encore ».
+    """
+    try:
+        return json.loads(blob.download_as_bytes()), blob.generation
+    except gexc.NotFound:
+        return [], 0
+
+
+def save_students(blob, students, generation):
+    """Ecrit la liste, mais SEULEMENT si elle n'a pas bouge depuis la lecture.
+
+    `if_generation_match` fait echouer l'ecriture (PreconditionFailed) si un autre
+    etudiant s'est inscrit entre le download et l'upload. Sans ca, deux inscriptions
+    simultanees — cas normal quand la promo s'inscrit en meme temps en debut de
+    seance — s'ecrasent l'une l'autre et un etudiant disparait de la liste.
+    """
+    blob.storage_class = "STANDARD"  # le bucket est en NEARLINE, taille pour l'archive
+    blob.upload_from_string(
+        json.dumps(students, indent=2, ensure_ascii=False),
+        content_type="application/json",
+        if_generation_match=generation,
+    )
+
+
+def inscrire(blob, email, essais=5):
+    """Ajoute un email a la liste. Renvoie (liste a jour, True si nouvel inscrit).
+
+    Relit et reessaie tant que quelqu'un d'autre ecrit en meme temps.
+    """
+    for _ in range(essais):
+        students, generation = load_students(blob)
+        if email in students:
+            return students, False
+        try:
+            save_students(blob, students + [email], generation)
+            return students + [email], True
+        except gexc.PreconditionFailed:
+            continue  # une autre inscription est passee avant : on relit
+    raise RuntimeError(
+        "Trop d'inscriptions simultanées, l'enregistrement n'a pas abouti. "
+        "Réessayez dans quelques secondes."
+    )
+
+
+def desinscrire(blob, email, essais=5):
+    """Retire un email de la liste, avec la meme protection contre l'ecrasement."""
+    for _ in range(essais):
+        students, generation = load_students(blob)
+        if email not in students:
+            return students
+        restants = [e for e in students if e != email]
+        try:
+            save_students(blob, restants, generation)
+            return restants
+        except gexc.PreconditionFailed:
+            continue
+    raise RuntimeError("Écriture concurrente, la suppression n'a pas abouti.")
 
 
 def get_credentials():
@@ -166,6 +232,19 @@ def message_erreur_acces(e, email):
     return f"**{email}** : {txt}"
 
 
+def meme_compte(a, b):
+    """Deux ecritures d'une meme adresse Google.
+
+    Google NE STOCKE PAS l'adresse telle qu'on l'envoie : il la remplace par la
+    forme canonique du compte, qui garde la casse choisie par l'etudiant a la
+    creation. On ecrit `user:barrymendy@gmail.com`, la policy contient ensuite
+    `user:Barrymendy@gmail.com`. Toute comparaison exacte echoue alors, et
+    l'etudiant apparait « sans aucun role » alors qu'il a bien tous ses acces.
+    On compare donc toujours en ignorant la casse.
+    """
+    return a.lower() == b.lower()
+
+
 def add_roles(client, project_id, email, roles):
     policy = get_iam_policy(client, project_id)
     member = f"user:{email}"
@@ -174,7 +253,7 @@ def add_roles(client, project_id, email, roles):
         binding_found = False
         for binding in policy.bindings:
             if binding.role == role:
-                if member not in binding.members:
+                if not any(meme_compte(m, member) for m in binding.members):
                     binding.members.append(member)
                 binding_found = True
                 break
@@ -186,12 +265,16 @@ def add_roles(client, project_id, email, roles):
 
 
 def remove_roles(client, project_id, email, roles):
+    """Retire des roles projet. Insensible a la casse : sans ca, un compte stocke
+    par Google sous `user:Barrymendy@gmail.com` ne serait JAMAIS retire, et
+    l'etudiant garderait ses acces apres la fin du seminaire."""
     policy = get_iam_policy(client, project_id)
     member = f"user:{email}"
 
     for binding in policy.bindings:
-        if binding.role in roles and member in binding.members:
-            binding.members.remove(member)
+        if binding.role in roles:
+            for m in [m for m in binding.members if meme_compte(m, member)]:
+                binding.members.remove(m)
 
     set_iam_policy(client, project_id, policy)
 
@@ -211,16 +294,16 @@ def dataset_access(bqc, project_id, dataset_id, emails, accorder=True):
         ds = bqc.get_dataset(f"{project_id}.{dataset_id}")
         entries = list(ds.access_entries)
         if accorder:
-            presents = {e.entity_id for e in entries
+            presents = {e.entity_id.lower() for e in entries
                         if e.entity_type == "userByEmail" and e.role == "READER"}
             for email in cibles:
-                if email not in presents:
+                if email.lower() not in presents:
                     entries.append(bigquery.AccessEntry("READER", "userByEmail", email))
         else:
-            enleve = set(cibles)
+            enleve = {e.lower() for e in cibles}
             entries = [e for e in entries
                        if not (e.entity_type == "userByEmail" and e.role == "READER"
-                               and e.entity_id in enleve)]
+                               and e.entity_id.lower() in enleve)]
         ds.access_entries = entries
         bqc.update_dataset(ds, ["access_entries"])
 
@@ -239,9 +322,14 @@ def dataset_access(bqc, project_id, dataset_id, emails, accorder=True):
 
 
 def dataset_readers(bqc, project_id, dataset_id):
-    """Emails ayant un accès lecture sur ce dataset."""
+    """Emails ayant un accès lecture sur ce dataset, en minuscules.
+
+    BigQuery renvoie l'adresse dans la casse du compte Google, pas dans celle
+    qu'on a envoyée : on normalise ici pour que la comparaison avec la liste
+    des inscrits (toujours en minuscules) fonctionne.
+    """
     ds = bqc.get_dataset(f"{project_id}.{dataset_id}")
-    return {e.entity_id for e in ds.access_entries
+    return {e.entity_id.lower() for e in ds.access_entries
             if e.entity_type == "userByEmail" and e.role == "READER"}
 
 
@@ -259,8 +347,9 @@ def get_roles_by_student(client, project_id, students):
         label = label_by_role.get(binding.role)
         if label is None:
             continue
+        membres = {m.lower() for m in binding.members}
         for email in students:
-            if f"user:{email}" in binding.members:
+            if f"user:{email}".lower() in membres:
                 granted[email].append(label)
 
     # Ordre stable : celui du dict ROLES, pas celui de la policy
@@ -344,7 +433,17 @@ st.caption(
 credentials = get_credentials()
 client = resourcemanager_v3.ProjectsClient(credentials=credentials)
 bqc = bq_client(credentials, PROJECT_ID)
-students = load_students()
+
+etat = blob_etat(credentials)
+try:
+    students, _ = load_students(etat)
+except Exception as e:
+    st.error(
+        f"Impossible de lire la liste des inscrits sur `gs://{BUCKET_ETAT}/{CHEMIN_ETAT}` : {e}\n\n"
+        "**Rien n'est perdu** — la liste est sur Cloud Storage, pas dans cette app. "
+        "Vérifiez les droits du compte de service et rechargez la page."
+    )
+    st.stop()
 
 # --- Tabs ---
 tab_register, tab_admin = st.tabs(["📝 Inscription étudiant", "🔧 Admin"])
@@ -366,12 +465,16 @@ with tab_register:
             email = email.strip().lower()
             if "@" not in email or "." not in email.split("@")[-1]:
                 st.warning("Vérifiez que c'est bien une adresse email valide.")
-            elif email in students:
-                st.info("Vous êtes déjà inscrit(e).")
             else:
-                students.append(email)
-                save_students(students)
-                st.success(f"✅ {email} inscrit(e) avec succès !")
+                try:
+                    students, nouveau = inscrire(etat, email)
+                except Exception as e:
+                    st.error(f"L'inscription n'a pas pu être enregistrée : {e}")
+                else:
+                    if nouveau:
+                        st.success(f"✅ {email} inscrit(e) avec succès !")
+                    else:
+                        st.info("Vous êtes déjà inscrit(e).")
 
 # --- Tab 2 : Admin ---
 with tab_admin:
@@ -387,6 +490,12 @@ with tab_admin:
         st.info("Aucun étudiant inscrit pour le moment.")
     else:
         st.write(f"**{len(students)} étudiant(s) inscrit(s)**")
+        st.caption(
+            f"Liste conservée sur `gs://{BUCKET_ETAT}/{CHEMIN_ETAT}` — elle survit "
+            "aux redémarrages de l'app. **L'ordre de cette liste détermine le numéro "
+            "de sujet d'examen de chaque étudiant** : supprimer quelqu'un décale tous "
+            "ceux inscrits après lui, donc ré-exportez les attributions après coup."
+        )
 
         # Les rôles sont relus à chaque exécution du script ; ce bouton force simplement
         # un rerun pour rafraîchir après un changement fait ailleurs (console GCP).
@@ -409,7 +518,8 @@ with tab_admin:
                 "Email": sorted(granted),
                 "Rôles projet": [", ".join(granted[e]) or "— aucun —" for e in sorted(granted)],
                 "Datasets lisibles": [
-                    ", ".join(ds for ds in DATASETS_AUTORISES if e in lecteurs[ds]) or "— aucun —"
+                    ", ".join(ds for ds in DATASETS_AUTORISES
+                              if e.lower() in lecteurs[ds]) or "— aucun —"
                     for e in sorted(granted)
                 ],
             },
@@ -417,7 +527,7 @@ with tab_admin:
         )
 
         sans_data = [e for e in granted
-                     if not any(e in lecteurs[ds] for ds in DATASETS_AUTORISES)]
+                     if not any(e.lower() in lecteurs[ds] for ds in DATASETS_AUTORISES)]
         if sans_data:
             st.info(
                 f"{len(sans_data)} étudiant(s) sans accès aux données. "
@@ -608,7 +718,6 @@ with tab_admin:
                     "probablement parce qu'ils n'avaient jamais été accordés. "
                     "L'étudiant est quand même retiré de la liste."
                 )
-            students.remove(email_to_remove)
-            save_students(students)
+            students = desinscrire(etat, email_to_remove)
             st.success(f"{email_to_remove} supprimé(e) de la liste.")
             st.rerun()
